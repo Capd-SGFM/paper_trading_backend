@@ -3,17 +3,35 @@ from pydantic import BaseModel
 from typing import List
 import datetime
 from collector import collector
-from routers import orders, market
+from routers import orders, market, accounts, websocket
 
 app = FastAPI(title="Paper Trading Backend")
 
 app.include_router(orders.router)
 app.include_router(market.router)
+app.include_router(accounts.router)
+app.include_router(websocket.router)
 
 @app.on_event("startup")
 async def startup_event():
+    # Print all routes
+    import sys
+    print("STARTUP EVENT STARTED", flush=True)
+    print("Registered Routes:", flush=True)
+    for route in app.routes:
+        if hasattr(route, "methods"):
+            print(f"Route: {route.path} {route.methods}", flush=True)
+        else:
+            print(f"Route: {route.path} (WebSocket)", flush=True)
+
     # 앱 시작 시 마켓 데이터 초기화 (Leverage Brackets 등)
     await collector.initialize_market_data()
+    
+    # 수집기 자동 시작
+    target_symbols = ["BTCUSDT", "ETHUSDT", "XRPUSDT", "SOLUSDT", "DOGEUSDT"]
+    target_symbols = ["BTCUSDT", "ETHUSDT", "XRPUSDT", "SOLUSDT", "DOGEUSDT"]
+    await collector.start(target_symbols)
+    
 
 @app.get("/")
 def read_root():

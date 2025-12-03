@@ -5,6 +5,7 @@ import aiohttp
 import hmac
 import hashlib
 import os
+import redis
 from datetime import datetime
 from typing import List, Dict, Optional
 from sqlalchemy import text
@@ -22,6 +23,9 @@ class BinanceCollector:
         self.session: Optional[aiohttp.ClientSession] = None
         self.last_updated: Optional[datetime] = None
         
+        # Redis Client
+        self.redis_client = redis.Redis.from_url("redis://redis:6379/0")
+
         # Batch processing buffers
         self.trade_buffer: List[Dict] = []
         self.last_batch_save_time = datetime.now()
@@ -174,8 +178,8 @@ class BinanceCollector:
         # streams = [f"{s.lower()}@aggTrade/{s.lower()}@depth20@100ms" for s in self.active_symbols]
         # url = base_url + "/".join(streams)
         
-        # 테스트용: BTCUSDT만 연결
-        url = base_url + "btcusdt@aggTrade/btcusdt@depth20@100ms"
+        # 테스트용: BTCUSDT만 연결 (Ticker, Trade, Depth)
+        url = base_url + "btcusdt@ticker/btcusdt@aggTrade/btcusdt@depth20@100ms"
 
         logger.info(f"Connecting to WebSocket: {url}")
 
@@ -199,39 +203,72 @@ class BinanceCollector:
                 await asyncio.sleep(5)  # 재연결 대기
 
     async def _handle_message(self, data: Dict):
-        """메시지 처리 (DB 저장 등)"""
+        """메시지 처리 (DB 저장 및 Redis Publish)"""
         stream = data.get("stream")
         payload = data.get("data")
 
         if not payload:
             return
 
-        if "aggTrade" in stream:
-            # Trade 데이터 버퍼링
-            trade_data = {
-                "symbol": payload['s'],
-                "price": float(payload['p']),
-                "quantity": float(payload['q']),
-                "side": "SELL" if payload['m'] else "BUY", 
-                "trade_time": datetime.fromtimestamp(payload['T'] / 1000),
-                "trade_id": str(payload['a'])
-            }
-            self.trade_buffer.append(trade_data)
-            
-            # 매칭 엔진 호출 (지정가 주문 체결 확인)
-            # 성능을 위해 비동기로 던져두거나, 여기서 바로 await 할 수 있음
-            # 실시간성이 중요하므로 await 권장
-            from matching_engine import matching_engine
-            await matching_engine.process_limit_orders(trade_data)
-            
-            # 버퍼가 차거나 일정 시간이 지나면 저장
-            if len(self.trade_buffer) >= 50 or (datetime.now() - self.last_batch_save_time).total_seconds() > 1.0:
-                await self._save_trades(self.trade_buffer)
-                self.trade_buffer = []
-                self.last_batch_save_time = datetime.now()
+        try:
+            if "ticker" in stream:
+                # Ticker 데이터 Redis Publish
+                message = json.dumps({
+                    "type": "ticker",
+                    "symbol": payload['s'],
+                    "price": float(payload['c']),
+                    "timestamp": datetime.fromtimestamp(payload['E'] / 1000).isoformat()
+                })
+                self.redis_client.publish("market_data", message)
 
-        elif "depth" in stream:
-            await self._save_orderbook(payload)
+            elif "aggTrade" in stream:
+                # Trade 데이터 버퍼링
+                trade_data = {
+                    "symbol": payload['s'],
+                    "price": float(payload['p']),
+                    "quantity": float(payload['q']),
+                    "side": "SELL" if payload['m'] else "BUY", 
+                    "trade_time": datetime.fromtimestamp(payload['T'] / 1000),
+                    "trade_id": str(payload['a'])
+                }
+                self.trade_buffer.append(trade_data)
+                
+                # Redis Publish
+                message = json.dumps({
+                    "type": "trade",
+                    "symbol": trade_data['symbol'],
+                    "price": trade_data['price'],
+                    "quantity": trade_data['quantity'],
+                    "side": trade_data['side'],
+                    "timestamp": trade_data['trade_time'].isoformat()
+                })
+                self.redis_client.publish("market_data", message)
+                
+                # 매칭 엔진 호출 (지정가 주문 체결 확인)
+                from matching_engine import matching_engine
+                await matching_engine.process_limit_orders(trade_data)
+                
+                # 버퍼가 차거나 일정 시간이 지나면 저장
+                if len(self.trade_buffer) >= 50 or (datetime.now() - self.last_batch_save_time).total_seconds() > 1.0:
+                    await self._save_trades(self.trade_buffer)
+                    self.trade_buffer = []
+                    self.last_batch_save_time = datetime.now()
+
+            elif "depth" in stream:
+                # Orderbook 데이터 Redis Publish
+                message = json.dumps({
+                    "type": "depth",
+                    "symbol": payload['s'],
+                    "bids": payload['b'],
+                    "asks": payload['a'],
+                    "timestamp": datetime.fromtimestamp(payload['E'] / 1000).isoformat()
+                })
+                self.redis_client.publish("market_data", message)
+
+                await self._save_orderbook(payload)
+
+        except Exception as e:
+            logger.error(f"Error handling message: {e}")
 
     async def _save_trades(self, trades: List[Dict]):
         """체결 내역 일괄 저장"""
@@ -245,7 +282,6 @@ class BinanceCollector:
                 VALUES (:symbol, :price, :quantity, :side, :trade_time, :trade_id)
             """)
             await conn.execute(stmt, trades)
-            # logger.info(f"Saved {len(trades)} trades")
 
     async def _save_orderbook(self, payload: Dict):
         """오더북 업데이트 (Upsert)"""
