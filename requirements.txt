@@ -8,3 +8,4 @@ redis
 celery
 python-dotenv
 requests
+httpx

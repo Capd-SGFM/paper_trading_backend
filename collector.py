@@ -255,6 +255,7 @@ class BinanceCollector:
                     self.last_batch_save_time = datetime.now()
 
             elif "depth" in stream:
+                logger.info(f"Received orderbook depth data for {payload.get('s', 'UNKNOWN')}")
                 # Orderbook 데이터 Redis Publish
                 message = json.dumps({
                     "type": "depth",
@@ -266,9 +267,11 @@ class BinanceCollector:
                 self.redis_client.publish("market_data", message)
 
                 await self._save_orderbook(payload)
+                logger.info(f"Saved orderbook data for {payload['s']}")
 
         except Exception as e:
-            logger.error(f"Error handling message: {e}")
+            logger.error(f"Error handling message: {e}", exc_info=True)
+
 
     async def _save_trades(self, trades: List[Dict]):
         """체결 내역 일괄 저장"""
@@ -284,42 +287,42 @@ class BinanceCollector:
             await conn.execute(stmt, trades)
 
     async def _save_orderbook(self, payload: Dict):
-        """오더북 업데이트 (Upsert)"""
-        symbol = payload['s']
-        bids = payload['b'] # [[price, qty], ...]
-        asks = payload['a']
-        
-        async_engine = DBConnectionManager.get_async_engine()
-        async with async_engine.begin() as conn:
-            # Bids 처리
-            for price, qty in bids:
-                if float(qty) == 0:
-                    await conn.execute(text("""
-                        DELETE FROM futures.orderbook 
-                        WHERE symbol = :symbol AND side = 'BID' AND price = :price
-                    """), {"symbol": symbol, "price": float(price)})
-                else:
-                    await conn.execute(text("""
-                        INSERT INTO futures.orderbook (symbol, side, price, quantity, updated_at)
-                        VALUES (:symbol, 'BID', :price, :quantity, NOW())
-                        ON CONFLICT (symbol, side, price) 
-                        DO UPDATE SET quantity = EXCLUDED.quantity, updated_at = NOW()
-                    """), {"symbol": symbol, "price": float(price), "quantity": float(qty)})
+        """오더북 전체 교체 (스냅샷 방식)"""
+        try:
+            symbol = payload['s']
+            bids = payload['b'] # [[price, qty], ...]
+            asks = payload['a']
+            
+            logger.info(f"Replacing orderbook for {symbol}: {len(bids)} bids, {len(asks)} asks")
+            
+            async_engine = DBConnectionManager.get_async_engine()
+            async with async_engine.begin() as conn:
+                # 1. 기존 오더북 데이터 전체 삭제 (스냅샷 교체 방식)
+                await conn.execute(text("""
+                    DELETE FROM futures.orderbook 
+                    WHERE symbol = :symbol
+                """), {"symbol": symbol})
+                
+                # 2. Bids 삽입 (qty > 0인 것만)
+                for price, qty in bids:
+                    if float(qty) > 0:
+                        await conn.execute(text("""
+                            INSERT INTO futures.orderbook (symbol, side, price, quantity, updated_at)
+                            VALUES (:symbol, 'BID', :price, :quantity, NOW())
+                        """), {"symbol": symbol, "price": float(price), "quantity": float(qty)})
 
-            # Asks 처리
-            for price, qty in asks:
-                if float(qty) == 0:
-                    await conn.execute(text("""
-                        DELETE FROM futures.orderbook 
-                        WHERE symbol = :symbol AND side = 'ASK' AND price = :price
-                    """), {"symbol": symbol, "price": float(price)})
-                else:
-                    await conn.execute(text("""
-                        INSERT INTO futures.orderbook (symbol, side, price, quantity, updated_at)
-                        VALUES (:symbol, 'ASK', :price, :quantity, NOW())
-                        ON CONFLICT (symbol, side, price) 
-                        DO UPDATE SET quantity = EXCLUDED.quantity, updated_at = NOW()
-                    """), {"symbol": symbol, "price": float(price), "quantity": float(qty)})
+                # 3. Asks 삽입 (qty > 0인 것만)
+                for price, qty in asks:
+                    if float(qty) > 0:
+                        await conn.execute(text("""
+                            INSERT INTO futures.orderbook (symbol, side, price, quantity, updated_at)
+                            VALUES (:symbol, 'ASK', :price, :quantity, NOW())
+                        """), {"symbol": symbol, "price": float(price), "quantity": float(qty)})
+            
+            logger.info(f"Successfully replaced orderbook for {symbol}")
+        except Exception as e:
+            logger.error(f"Failed to save orderbook: {e}", exc_info=True)
+
 
     def get_status(self):
         return {

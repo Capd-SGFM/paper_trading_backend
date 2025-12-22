@@ -29,8 +29,12 @@ async def startup_event():
     
     # 수집기 자동 시작
     target_symbols = ["BTCUSDT", "ETHUSDT", "XRPUSDT", "SOLUSDT", "DOGEUSDT"]
-    target_symbols = ["BTCUSDT", "ETHUSDT", "XRPUSDT", "SOLUSDT", "DOGEUSDT"]
     await collector.start(target_symbols)
+    
+    # 청산 모니터 시작
+    from liquidation_monitor import liquidation_monitor
+    import asyncio
+    asyncio.create_task(liquidation_monitor.start())
     
 
 @app.get("/")

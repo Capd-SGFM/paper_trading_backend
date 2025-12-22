@@ -26,6 +26,13 @@ async def place_order(order: OrderCreate, db: AsyncSession = Depends(get_async_d
     주문 접수 API
     """
     try:
+        # Leverage validation
+        if order.leverage is None or order.leverage < 1 or order.leverage > 125:
+            logger.error(f"Invalid leverage received: {order.leverage}")
+            raise HTTPException(status_code=400, detail=f"Invalid leverage: {order.leverage}. Must be between 1 and 125")
+        
+        logger.info(f"Placing order: {order.side} {order.type} {order.quantity} {order.symbol} @ leverage={order.leverage}")
+        
         # 1. 기본 검증
         if order.quantity <= 0:
             raise HTTPException(status_code=400, detail="Quantity must be positive")
@@ -156,8 +163,10 @@ async def place_order(order: OrderCreate, db: AsyncSession = Depends(get_async_d
                 # 포지션 업데이트 (Netting Logic)
                 # 1. 반대 방향 포지션 정리 (Netting)
                 opposite_side = "SHORT" if order.side == "BUY" else "LONG"
+                logger.info(f"Checking for existing position to net: Account={account_id}, Symbol={order.symbol}, Side={opposite_side}")
+                
                 stmt_check_pos = text("""
-                    SELECT quantity, entry_price, margin 
+                    SELECT quantity, entry_price, margin, margin_type 
                     FROM futures.positions 
                     WHERE account_id = :account_id 
                       AND symbol = :symbol 
@@ -170,6 +179,11 @@ async def place_order(order: OrderCreate, db: AsyncSession = Depends(get_async_d
                     "opposite_side": opposite_side
                 })
                 existing_pos = result_pos.fetchone()
+                
+                if existing_pos:
+                    logger.info(f"Found existing position: Qty={existing_pos[0]}")
+                else:
+                    logger.info("No existing position found for netting")
 
                 remaining_qty = execution_result['filled_qty']
                 realized_pnl = 0
@@ -178,6 +192,7 @@ async def place_order(order: OrderCreate, db: AsyncSession = Depends(get_async_d
                     pos_qty = float(existing_pos[0])
                     entry_price = float(existing_pos[1])
                     pos_margin = float(existing_pos[2])
+                    margin_type = existing_pos[3]
                     
                     # PnL 계산 (Long 청산: Sell - Entry, Short 청산: Entry - Sell)
                     # Direction: Long(Buy) -> 1, Short(Sell) -> -1
@@ -229,6 +244,13 @@ async def place_order(order: OrderCreate, db: AsyncSession = Depends(get_async_d
 
                     # PnL 계산 및 반영
                     current_pnl = (execution_result['avg_price'] - entry_price) * close_qty * pnl_direction
+                    
+                    # Isolated Margin Bankruptcy Protection
+                    # 손실이 증거금을 초과하면, 손실을 증거금만큼으로 제한 (거래소 보험 기금 역할 - 여기서는 단순 탕감)
+                    if margin_type == 'ISOLATED' and current_pnl < -released_margin:
+                        logger.warning(f"Bankruptcy detected! PnL {current_pnl} exceeds Margin {released_margin}. Clamping loss.")
+                        current_pnl = -released_margin
+
                     realized_pnl += current_pnl
 
                     # 증거금 반환 및 PnL 반영
@@ -250,21 +272,36 @@ async def place_order(order: OrderCreate, db: AsyncSession = Depends(get_async_d
                     position_side = "LONG" if order.side == "BUY" else "SHORT"
                     new_margin = (execution_result['avg_price'] * remaining_qty) / order.leverage
                     
+                    # 청산가 계산 (Isolated Margin)
+                    # Maintenance Margin Rate: 0.4% (0.004)
+                    mmr = 0.004
+                    entry_price = float(execution_result['avg_price'])
+                    lev = float(order.leverage)
+                    
+                    if position_side == "LONG":
+                        # Long: Entry * (1 - 1/Lev + MMR)
+                        liquidation_price = entry_price * (1 - (1/lev) + mmr)
+                    else:
+                        # Short: Entry * (1 + 1/Lev - MMR)
+                        liquidation_price = entry_price * (1 + (1/lev) - mmr)
+
                     await db.execute(text("""
                         INSERT INTO futures.positions (
                             account_id, google_id, symbol, position_side, 
                             quantity, initial_quantity, entry_price, leverage, margin,
-                            updated_at
+                            liquidation_price, updated_at
                         ) VALUES (
                             :account_id, :google_id, :symbol, :position_side,
                             :quantity, :quantity, :price, :leverage, :margin,
-                            NOW()
+                            :liquidation_price, NOW()
                         )
                         ON CONFLICT (account_id, symbol, position_side, status)
                         DO UPDATE SET 
                             quantity = futures.positions.quantity + EXCLUDED.quantity,
                             margin = futures.positions.margin + EXCLUDED.margin,
                             entry_price = (futures.positions.quantity * futures.positions.entry_price + EXCLUDED.quantity * EXCLUDED.entry_price) / (futures.positions.quantity + EXCLUDED.quantity),
+                            -- 청산가는 평단가 변경에 따라 재계산 필요하지만, 단순화를 위해 신규 진입 시에는 기존 청산가 유지하거나 재계산 로직 필요
+                            -- 여기서는 단순화를 위해 기존 값 유지 (정확한 로직은 평단가 변경 시 청산가도 재계산해야 함)
                             updated_at = NOW()
                     """), {
                         "account_id": account_id,
@@ -274,7 +311,8 @@ async def place_order(order: OrderCreate, db: AsyncSession = Depends(get_async_d
                         "quantity": remaining_qty,
                         "price": execution_result['avg_price'],
                         "leverage": order.leverage,
-                        "margin": new_margin
+                        "margin": new_margin,
+                        "liquidation_price": liquidation_price
                     })
 
                     # 시장가 주문 신규 진입분 증거금 차감

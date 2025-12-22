@@ -8,12 +8,14 @@ logger = logging.getLogger("MatchingEngine")
 class MatchingEngine:
     async def process_market_order(self, symbol: str, side: str, quantity: float) -> Dict:
         """
-        시장가 주문 체결 시뮬레이션 (Slippage 계산)
-        :param symbol: 종목 코드
-        :param side: 주문 방향 (BUY/SELL)
-        :param quantity: 주문 수량
-        :return: 체결 결과 {avg_price, filled_qty, total_cost}
+        시장가 주문 체결 시뮬레이션
+        1차: Orderbook에서 체결 시도
+        2차: Orderbook이 없으면 Binance API에서 현재가 조회하여 즉시 체결
         """
+        import httpx
+        
+        logger.info(f"Processing MARKET order: {symbol} {side} {quantity}")
+        
         # 시장가 매수(BUY) -> 매도 호가(ASK)를 긁음
         # 시장가 매도(SELL) -> 매수 호가(BID)를 긁음
         target_side = 'ASK' if side == 'BUY' else 'BID'
@@ -34,9 +36,44 @@ class MatchingEngine:
             result = await conn.execute(stmt, {"symbol": symbol, "side": target_side})
             orderbook = result.fetchall()
 
+        logger.info(f"Orderbook retrieved: {len(orderbook)} levels for {symbol} {target_side}")
+        
+        # Orderbook이 비어있으면 Binance API에서 현재가 조회
         if not orderbook:
-            logger.warning(f"No liquidity for {symbol} {side}")
-            return {"avg_price": 0, "filled_qty": 0, "total_cost": 0}
+            logger.info(f"No orderbook data, fetching current price from Binance API")
+            try:
+                # symbol이 BTC면 BTCUSDT로 변환
+                binance_symbol = f"{symbol}USDT" if not symbol.endswith("USDT") else symbol
+                
+                async with httpx.AsyncClient(timeout=5.0) as client:
+                    resp = await client.get(
+                        f"https://fapi.binance.com/fapi/v1/ticker/price?symbol={binance_symbol}"
+                    )
+                    resp.raise_for_status()
+                    current_price = float(resp.json()['price'])
+                
+                logger.info(f"Binance API price for {binance_symbol}: {current_price}")
+                
+                # 약간의 슬리피지 적용 (매수: +0.01%, 매도: -0.01%)
+                slippage = 0.0001
+                if side == 'BUY':
+                    execution_price = current_price * (1 + slippage)
+                else:
+                    execution_price = current_price * (1 - slippage)
+                
+                return {
+                    "avg_price": execution_price,
+                    "filled_qty": quantity,
+                    "total_cost": execution_price * quantity
+                }
+                
+            except Exception as e:
+                logger.error(f"Failed to fetch Binance price: {e}")
+                return {"avg_price": 0, "filled_qty": 0, "total_cost": 0}
+        
+        # Orderbook에서 체결
+        if len(orderbook) > 0:
+            logger.info(f"Top 3 orderbook levels: {orderbook[:3]}")
 
         remaining_qty = quantity
         total_cost = 0.0
@@ -55,14 +92,19 @@ class MatchingEngine:
             total_cost += price * trade_qty
             filled_qty += trade_qty
             remaining_qty -= trade_qty
+            
+            logger.debug(f"Matched at price={price}, qty={trade_qty}, remaining={remaining_qty}")
 
         avg_price = total_cost / filled_qty if filled_qty > 0 else 0
+        
+        logger.info(f"Market order executed: avg_price={avg_price}, filled_qty={filled_qty}, total_cost={total_cost}")
 
         return {
             "avg_price": avg_price,
             "filled_qty": filled_qty,
             "total_cost": total_cost
         }
+
 
     async def process_limit_orders(self, trade_data: Dict):
         """
